@@ -62,7 +62,14 @@ pub enum OutgoingMessage {
         task_data: String,
     },
     #[serde(rename = "ack")]
-    Ack { #[serde(skip_serializing_if = "Option::is_none")] task_id: Option<String>, message: String },
+    Ack {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        message: String,
+        /// Which shard an enqueue landed in (informational; SDKs ignore).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shard: Option<String>,
+    },
     #[serde(rename = "progress")]
     Progress {
         task_id: String,
@@ -78,5 +85,24 @@ pub enum OutgoingMessage {
         total_dlq: u64,
         queue_depth: usize,
         uptime_secs: u64,
+        /// Per-shard rollup breakdown (informational; SDKs may ignore).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        per_shard: Option<Vec<ShardStat>>,
     },
+    /// Informational membership snapshot, pushed on boot and on standby
+    /// promotion. SDKs use it for display only — never for routing.
+    #[serde(rename = "membership")]
+    Membership {
+        queue: String,
+        shards: u32,
+        owned: Vec<String>,
+        version: u64,
+    },
+}
+
+/// One shard's contribution to a `stats` rollup.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ShardStat {
+    pub shard: String,
+    pub depth: usize,
 }

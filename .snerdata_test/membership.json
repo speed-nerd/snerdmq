@@ -1,0 +1,15 @@
+{
+  "queue": "snerdmq-daemon",
+  "shards": 2,
+  "version": 2,
+  "claims": {
+    "shard-1": {
+      "owner": "unknown-host@pid-43571",
+      "lease_expiry": "2026-09-07T11:05:55.088487Z"
+    },
+    "shard-0": {
+      "owner": "unknown-host@pid-43571",
+      "lease_expiry": "2026-09-07T11:05:55.083436Z"
+    }
+  }
+}
