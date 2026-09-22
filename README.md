@@ -67,7 +67,7 @@ To power complex AI workflows, tasks can now be configured with advanced orchest
 When `max_execution_seconds` is provided, the Rust daemon wraps the execution in a `tokio::time::timeout`. If the task execution takes longer than the timeout, the daemon will cancel the task, free up the worker slot, and mark the execution as failed (it will be retried if `max_retries` allows).
 
 ### 🌐 HTTP Webhooks (Serverless Execution)
-SnerdMQ can now act as a true distributed orchestrator. By supplying a `webhook_url` in the payload, SnerdMQ will fire an HTTP POST request to that URL to execute the task. 
+SnerdMQ can now act as a true distributed orchestrator. By supplying a `webhook_url` in the payload, SnerdMQ will completely bypass your local SDK handlers and dispatch the task payload via an HTTP POST request directly to the specified URL.
 
 ```json
 {
@@ -82,6 +82,55 @@ SnerdMQ can now act as a true distributed orchestrator. By supplying a `webhook_
 
 The HTTP request will contain the header `X-SnerdMQ-Event: Execute`. 
 If a webhook task permanently fails (reaches `max_retries`), the Dead Letter Queue event is automatically fired via a final HTTP POST to the exact same `webhook_url` but with the header `X-SnerdMQ-Event: MaxRetriesReached`. This eliminates the need for SDK-side Max Retry handlers!
+
+**The "Stateless Polyglot Worker" Pattern**
+Because SnerdMQ acts as the robust broker handling persistence, timeouts, rate limits, and retries, your webhook receiver (the "worker") can be entirely stateless. For example, your Go monolith can act as the Producer & Broker by running the embedded `snerd-go` engine and pointing webhooks at your fast Rust microservice. 
+
+**Go (Producer & Broker):**
+```go
+// 1. Go manages the embedded database and orchestrator
+queue := snerd.NewAnyQueue("go-broker", 100, 1*time.Second)
+
+// 2. Create the task with a Webhook URL instead of a local handler
+webhookURL := "http://localhost:3000/api/worker/send-push"
+task, _ := snerd.CreateTask("SEND_PUSH", map[string]interface{}{"user_id": 1001}, 3, 0.5)
+task.WebhookUrl = &webhookURL
+
+// 3. Enqueue it. SnerdMQ handles the HTTP dispatch!
+queue.EnqueueSnerdTask(task)
+```
+
+**Rust (Worker Pools Broker Receiver):**
+```rust
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnerdWebhookPayload {
+    task_id: String,
+    task_type: String,
+    #[serde(rename = "data")]
+    parameters: String, 
+}
+
+// The receiver places the webhook into an isolated snerd-rust pool!
+async fn handle_send_push(
+    State(queue): State<Arc<SnerdQueue>>,
+    Json(payload): Json<SnerdWebhookPayload>
+) -> StatusCode {
+    
+    // 1. Enqueue it in an isolated pool for reliable execution and retry recovery
+    let mut task = RetryableTask::new(
+        payload.task_id, payload.task_type, payload.parameters,
+        3, 1.0, None, None, None, None, None, None, None, None,
+        Some("push-pool".to_string()) // pool
+    );
+    
+    // 2. Acknowledge the HTTP request immediately
+    match queue.enqueue(task) {
+        Ok(_) => StatusCode::OK,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+```
 
 ### 🕒 Cron Jobs vs. Retryable Jobs
 > - **A Cron Job** is a *Repeatable Job* that executes again **only after a success**, on a fixed schedule.

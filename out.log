@@ -1,0 +1,7 @@
+[Snerd] Queue './test_data' has 1 shard(s); this instance will claim up to 1.
+{"action":"membership","queue":"snerdmq-daemon","shards":1,"owned":["shard-0"],"version":1}
+[Snerd] Owning shard(s): shard-0
+[Snerd] SIGTERM received; draining...
+[Snerd] Shard 'shard-0' paused for drain.
+[Snerd] Shard 'shard-0' claim released.
+[Snerd] Shutdown complete.

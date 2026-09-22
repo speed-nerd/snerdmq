@@ -1,0 +1,6 @@
+{
+  "queue": "snerdmq-daemon",
+  "shards": 1,
+  "version": 2,
+  "claims": {}
+}
