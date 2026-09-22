@@ -13,13 +13,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::fs;
 use tokio::io::{AsyncBufReadExt, BufReader, stdin};
-use tokio::sync::{RwLock, Semaphore, oneshot};
+use tokio::sync::{RwLock, oneshot};
 
 use crate::file_store::FileStore;
 use crate::membership::{
     claimable_shards, owner_id, skew_margin, MembershipStore, RENEW_INTERVAL_SECS,
 };
-use crate::queue::{MaxRetryHandler, SnerdQueue, TaskHandler};
+use crate::queue::{MaxRetryHandler, SnerdQueue, TaskHandler, WorkerPoolManager};
 use crate::rate_limiter::RateLimiter;
 use crate::sharding::{resolve_layout, route_shard, shard_dir, try_lock_shard, ShardLock};
 use crate::task::RetryableTask;
@@ -59,6 +59,20 @@ struct RegisteredHandler {
     max_retry: MaxRetryHandler,
 }
 
+#[cfg(debug_assertions)]
+fn current_time() -> chrono::DateTime<chrono::Utc> {
+    let offset_secs = std::env::var("SNERD_TEST_CLOCK_OFFSET_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    chrono::Utc::now() + chrono::Duration::seconds(offset_secs)
+}
+
+#[cfg(not(debug_assertions))]
+fn current_time() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
+}
+
 /// The sharded runtime: membership client + owned shard engines.
 struct Runtime {
     dir: PathBuf,
@@ -66,12 +80,14 @@ struct Runtime {
     owner: String,
     max_shards: usize,
     skew: chrono::Duration,
-    /// Shared worker budget across ALL shard engines (100 concurrent tasks).
-    semaphore: Arc<Semaphore>,
+    /// Shared worker pools across ALL shard engines.
+    worker_pools: WorkerPoolManager,
     engines: RwLock<Vec<Arc<ShardEngine>>>,
     registered: RwLock<Vec<RegisteredHandler>>,
     /// Set to true when shutdown has been initiated.
     shutting_down: AtomicBool,
+    #[cfg(debug_assertions)]
+    test_heartbeat_paused: AtomicBool,
 }
 
 impl Runtime {
@@ -83,10 +99,12 @@ impl Runtime {
             owner: owner_id(),
             max_shards,
             skew: skew_margin(),
-            semaphore: Arc::new(Semaphore::new(max_workers)),
+            worker_pools: WorkerPoolManager::new(max_workers),
             engines: RwLock::new(Vec::new()),
             registered: RwLock::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
+            #[cfg(debug_assertions)]
+            test_heartbeat_paused: AtomicBool::new(false),
         }
     }
 
@@ -94,7 +112,7 @@ impl Runtime {
     /// A failed flock acquisition reverts the membership entry (zombie claim)
     /// before trying the next candidate.
     fn acquire_shards(&self) -> membership::Result<Vec<(String, ShardLock)>> {
-        let now = chrono::Utc::now();
+        let now = current_time();
         let membership = self.store.load()?;
         let candidates = claimable_shards(&membership, now, self.skew, &self.owner);
 
@@ -103,7 +121,7 @@ impl Runtime {
             if claimed.len() >= self.max_shards {
                 break;
             }
-            match self.store.claim(&shard, &self.owner, chrono::Utc::now(), self.skew)? {
+            match self.store.claim(&shard, &self.owner, current_time(), self.skew)? {
                 membership::ClaimOutcome::Claimed
                 | membership::ClaimOutcome::Renewed
                 | membership::ClaimOutcome::TakenOver { .. } => {}
@@ -154,11 +172,11 @@ impl Runtime {
         let tasks_log = sdir.join("tasks").join("tasks.log");
         let file_store = FileStore::new(&tasks_log)?;
         let rate_limiter = RateLimiter::new(&tasks_log);
-        let queue = Arc::new(SnerdQueue::new_with_semaphore(
+        let queue = Arc::new(SnerdQueue::new_with_pools(
             &format!("snerdmq-{}", shard),
             file_store,
             rate_limiter,
-            Arc::clone(&self.semaphore),
+            self.worker_pools.clone(),
         ));
 
         // Replay every previously registered handler onto the new engine.
@@ -303,7 +321,7 @@ fn cmd_validate(queue_dir: &str) -> bool {
 
     println!("[Snerd] validate: queue='{}' shards={} version={}", m.queue, m.shards, m.version);
 
-    let now = chrono::Utc::now();
+    let now = current_time();
     let skew = skew_margin();
     let mut healthy = true;
 
@@ -479,13 +497,17 @@ async fn main() {
                 if rt.shutting_down.load(Ordering::Acquire) {
                     return;
                 }
+                #[cfg(debug_assertions)]
+                if rt.test_heartbeat_paused.load(Ordering::Acquire) {
+                    continue;
+                }
                 let engines = rt.engines.read().await;
                 for engine in engines.iter() {
                     // Skip already-paused engines.
                     if engine.queue.paused.load(Ordering::Acquire) {
                         continue;
                     }
-                    match rt.store.renew(&engine.key, &rt.owner, chrono::Utc::now()) {
+                    match rt.store.renew(&engine.key, &rt.owner, current_time()) {
                         Ok(()) => {} // lease refreshed, engine stays Active
                         Err(crate::membership::MembershipError::LeaseLost { .. }) => {
                             eprintln!(
@@ -672,6 +694,7 @@ async fn main() {
                 cron,
                 webhook_url,
                 max_execution_seconds,
+                pool,
             }) => {
                 // Reject if shutting down.
                 if runtime.shutting_down.load(Ordering::Acquire) {
@@ -730,6 +753,7 @@ async fn main() {
                     cron,
                     webhook_url,
                     max_execution_seconds,
+                    pool,
                 );
                 if let Err(e) = engine.queue.enqueue(t) {
                     println!(
@@ -799,20 +823,32 @@ async fn main() {
                         depth,
                     });
                 }
+                let msg = OutgoingMessage::Stats {
+                    total_enqueued: metrics.total_enqueued.load(Ordering::Relaxed),
+                    total_executed: metrics.total_executed.load(Ordering::Relaxed),
+                    total_failed: metrics.total_failed.load(Ordering::Relaxed),
+                    total_dlq: metrics.total_dlq.load(Ordering::Relaxed),
+                    queue_depth,
+                    uptime_secs: metrics.start_time.elapsed().as_secs(),
+                    per_shard: Some(per_shard),
+                };
+                println!("{}", serde_json::to_string(&msg).unwrap());
+            }
+
+            #[cfg(debug_assertions)]
+            Ok(IncomingMessage::TestPauseHeartbeat) => {
+                runtime.test_heartbeat_paused.store(true, Ordering::Release);
                 println!(
                     "{}",
-                    serde_json::to_string(&OutgoingMessage::Stats {
-                        total_enqueued: metrics.total_enqueued.load(Ordering::Relaxed),
-                        total_executed: metrics.total_executed.load(Ordering::Relaxed),
-                        total_failed: metrics.total_failed.load(Ordering::Relaxed),
-                        total_dlq: metrics.total_dlq.load(Ordering::Relaxed),
-                        queue_depth,
-                        uptime_secs: metrics.start_time.elapsed().as_secs(),
-                        per_shard: Some(per_shard),
+                    serde_json::to_string(&OutgoingMessage::Ack {
+                        task_id: None,
+                        message: "Heartbeat paused for testing".to_string(),
+                        shard: None,
                     })
                     .unwrap()
                 );
             }
+
 
             Err(e) => {
                 println!(

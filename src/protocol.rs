@@ -28,6 +28,8 @@ pub enum IncomingMessage {
         webhook_url: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         max_execution_seconds: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pool: Option<String>,
     },
     #[serde(rename = "progress")]
     Progress {
@@ -42,6 +44,9 @@ pub enum IncomingMessage {
     },
     #[serde(rename = "stats")]
     Stats,
+    #[cfg(debug_assertions)]
+    #[serde(rename = "test_pause_heartbeat")]
+    TestPauseHeartbeat,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -14,6 +14,46 @@ use serde_json::json;
 use std::future::Future;
 use std::pin::Pin;
 
+#[derive(Clone)]
+pub struct WorkerPoolManager {
+    pub pools: Arc<HashMap<String, Arc<Semaphore>>>,
+    pub default_pool: Arc<Semaphore>,
+}
+
+impl WorkerPoolManager {
+    pub fn new(default_workers: usize) -> Self {
+        let mut pools = HashMap::new();
+        let mut default_pool = None;
+        
+        if let Ok(pools_str) = std::env::var("SNERD_POOLS") {
+            for part in pools_str.split(',') {
+                let parts: Vec<&str> = part.split('=').collect();
+                if parts.len() == 2 {
+                    let name = parts[0].trim().to_string();
+                    if let Ok(count) = parts[1].trim().parse::<usize>() {
+                        let sem = Arc::new(Semaphore::new(count));
+                        pools.insert(name.clone(), Arc::clone(&sem));
+                        if name == "default" {
+                            default_pool = Some(sem);
+                        }
+                    }
+                }
+            }
+        }
+        
+        let default_pool = default_pool.unwrap_or_else(|| {
+            let sem = Arc::new(Semaphore::new(default_workers));
+            pools.insert("default".to_string(), Arc::clone(&sem));
+            sem
+        });
+
+        Self {
+            pools: Arc::new(pools),
+            default_pool,
+        }
+    }
+}
+
 pub type TaskHandler = Arc<
     dyn Fn(RetryableTask) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync,
 >;
@@ -62,11 +102,11 @@ pub struct SnerdQueue {
     /// mapped to their completion time. Final safety net to prevent duplicate
     /// execution; entries are evicted after COMPLETED_TTL to bound memory.
     completed_tasks: Arc<Mutex<HashMap<String, Instant>>>,
-    worker_semaphore: Arc<Semaphore>,
-    /// Shared priority queue — workers always pop the highest-priority task next.
-    shared_pq: Arc<Mutex<BinaryHeap<PriorityTask>>>,
-    /// Number of active dispatcher loops (prevents duplicates).
-    dispatcher_count: Arc<std::sync::atomic::AtomicUsize>,
+    pub worker_pools: WorkerPoolManager,
+    /// Shared priority queues per pool — workers pop the highest-priority task next.
+    shared_pqs: Arc<Mutex<HashMap<String, Arc<Mutex<BinaryHeap<PriorityTask>>>>>>,
+    /// Number of active dispatcher loops per pool (prevents duplicates).
+    dispatcher_counts: Arc<Mutex<HashMap<String, Arc<std::sync::atomic::AtomicUsize>>>>,
     /// When true: no new enqueues accepted and process_due_tasks is a no-op.
     /// Flipped by the heartbeat thread on lease-loss or graceful shutdown.
     pub paused: Arc<AtomicBool>,
@@ -74,16 +114,16 @@ pub struct SnerdQueue {
 
 impl SnerdQueue {
     pub fn new(name: &str, file_store: FileStore, rate_limiter: RateLimiter) -> Self {
-        Self::new_with_semaphore(name, file_store, rate_limiter, Arc::new(Semaphore::new(100)))
+        Self::new_with_pools(name, file_store, rate_limiter, WorkerPoolManager::new(100))
     }
 
-    /// Like `new`, but sharing a worker semaphore with other queues — used by
-    /// the sharded daemon so all shard engines share one concurrency budget.
-    pub fn new_with_semaphore(
+    /// Like `new`, but sharing worker pools with other queues — used by
+    /// the sharded daemon so all shard engines share the concurrency budgets.
+    pub fn new_with_pools(
         name: &str,
         file_store: FileStore,
         rate_limiter: RateLimiter,
-        worker_semaphore: Arc<Semaphore>,
+        worker_pools: WorkerPoolManager,
     ) -> Self {
         let mut initial_hashes = HashSet::new();
         if let Ok(tasks) = file_store.read_tasks() {
@@ -106,9 +146,9 @@ impl SnerdQueue {
             executing_tasks: Arc::new(Mutex::new(HashSet::new())),
             queued_tasks: Arc::new(Mutex::new(HashSet::new())),
             completed_tasks: Arc::new(Mutex::new(HashMap::new())),
-            worker_semaphore,
-            shared_pq: Arc::new(Mutex::new(BinaryHeap::new())),
-            dispatcher_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            worker_pools,
+            shared_pqs: Arc::new(Mutex::new(HashMap::new())),
+            dispatcher_counts: Arc::new(Mutex::new(HashMap::new())),
             paused: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -218,14 +258,16 @@ impl SnerdQueue {
         };
 
         let now = Utc::now();
+        let mut pools_with_new_tasks = HashSet::new();
 
         // IMPORTANT: Check against LIVE executing_tasks and queued_tasks sets
         // (not snapshots) to prevent races where a task moves from queued → executing
         // between our snapshot and our check, making it invisible to both.
         {
-            let mut pq = self.shared_pq.lock().unwrap();
             let mut queued = self.queued_tasks.lock().unwrap();
             let executing = self.executing_tasks.lock().unwrap();
+            let mut pqs = self.shared_pqs.lock().unwrap();
+            
             for task in tasks {
                 if task.execute_at <= now
                     && task.retry_after_time <= now
@@ -234,38 +276,71 @@ impl SnerdQueue {
                     && !queued.contains(&task.task_id)
                 {
                     queued.insert(task.task_id.clone());
-                    pq.push(PriorityTask(task));
+                    
+                    let pool_name = task.pool.clone().unwrap_or_else(|| "default".to_string());
+                    let pq = pqs.entry(pool_name.clone()).or_insert_with(|| Arc::new(Mutex::new(BinaryHeap::new())));
+                    pq.lock().unwrap().push(PriorityTask(task));
+                    pools_with_new_tasks.insert(pool_name);
                 }
             }
         }
 
-        // Start a priority dispatcher if there are tasks queued and not too many dispatchers
-        let pq_len = self.shared_pq.lock().unwrap().len();
-        if pq_len > 0 && self.dispatcher_count.load(std::sync::atomic::Ordering::Relaxed) < 2 {
-            self.spawn_dispatcher();
+        // Start dispatchers for pools that have new tasks
+        for pool_name in pools_with_new_tasks {
+            let pq_len = {
+                let pqs = self.shared_pqs.lock().unwrap();
+                if let Some(pq) = pqs.get(&pool_name) {
+                    pq.lock().unwrap().len()
+                } else {
+                    0
+                }
+            };
+            
+            let should_spawn = if pq_len > 0 {
+                let mut counts = self.dispatcher_counts.lock().unwrap();
+                let count = counts.entry(pool_name.clone()).or_insert_with(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+                count.load(std::sync::atomic::Ordering::Relaxed) < 2
+            } else {
+                false
+            };
+            
+            if should_spawn {
+                self.spawn_dispatcher(&pool_name);
+            }
         }
     }
 
-    /// Spawns a persistent priority dispatcher that feeds tasks to workers
-    /// in strict priority order. The dispatcher acquires a semaphore permit
-    /// for each task, ensuring at most 100 concurrent executions. When a task
-    /// completes and releases its permit, the dispatcher wakes up and spawns
-    /// the next highest-priority task.
-    fn spawn_dispatcher(&self) {
-        self.dispatcher_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    /// Spawns a persistent priority dispatcher for a specific pool.
+    fn spawn_dispatcher(&self, pool_name: &str) {
+        let count = {
+            let mut counts = self.dispatcher_counts.lock().unwrap();
+            counts.entry(pool_name.to_string()).or_insert_with(|| Arc::new(std::sync::atomic::AtomicUsize::new(0))).clone()
+        };
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        
         let q = self.clone();
+        let pool_name_owned = pool_name.to_string();
+        
         tokio::spawn(async move {
+            let semaphore = q.worker_pools.pools.get(&pool_name_owned)
+                .cloned()
+                .unwrap_or_else(|| q.worker_pools.default_pool.clone());
+                
             loop {
-                // Acquire a concurrency permit (blocks if all 100 are in use)
-                let permit = match q.worker_semaphore.clone().acquire_owned().await {
+                // Acquire a concurrency permit for THIS pool
+                let permit = match semaphore.clone().acquire_owned().await {
                     Ok(p) => p,
                     Err(_) => break,
                 };
-
-                // Pop the highest-priority task from the shared queue
+                
+                // Pop the highest-priority task from THIS pool's shared queue
                 let task = {
-                    let mut pq = q.shared_pq.lock().unwrap();
-                    pq.pop()
+                    let pqs = q.shared_pqs.lock().unwrap();
+                    if let Some(pq) = pqs.get(&pool_name_owned) {
+                        pq.lock().unwrap().pop()
+                    } else {
+                        None
+                    }
                 };
 
                 match task {
@@ -312,7 +387,13 @@ impl SnerdQueue {
                     }
                 }
             }
-            q.dispatcher_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            
+            // Decrement dispatcher count for this pool
+            let count = {
+                let mut counts = q.dispatcher_counts.lock().unwrap();
+                counts.entry(pool_name_owned.clone()).or_insert_with(|| Arc::new(std::sync::atomic::AtomicUsize::new(0))).clone()
+            };
+            count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         });
     }
 

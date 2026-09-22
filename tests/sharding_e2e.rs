@@ -30,18 +30,41 @@ struct DaemonHandle {
     child: Child,
     /// Captured stderr lines, for diagnostics when a wait times out.
     stderr_lines: Arc<Mutex<Vec<String>>>,
+    /// Stdout receiver for waiting on messages.
+    stdout_rx: Option<mpsc::Receiver<String>>,
 }
 
 impl DaemonHandle {
     fn spawn(bin: &PathBuf, storage: &std::path::Path, max_shards: &str) -> Self {
-        let mut child = Command::new(bin)
-            .arg(storage.as_os_str())
+        Self::spawn_with_offset(bin, storage, max_shards, 0)
+    }
+
+    fn spawn_with_offset(bin: &PathBuf, storage: &std::path::Path, max_shards: &str, offset_secs: i64) -> Self {
+        Self::spawn_with_env(bin, storage, max_shards, offset_secs, None)
+    }
+
+    fn spawn_with_env(
+        bin: &PathBuf,
+        storage: &std::path::Path,
+        max_shards: &str,
+        offset_secs: i64,
+        extra_env: Option<Vec<(&str, &str)>>,
+    ) -> Self {
+        let mut cmd = Command::new(bin);
+        cmd.arg(storage.as_os_str())
             .env("SNERD_MAX_SHARDS", max_shards)
+            .env("SNERD_TEST_CLOCK_OFFSET_SECS", offset_secs.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to spawn daemon");
+            .stderr(Stdio::piped());
+            
+        if let Some(env_vars) = extra_env {
+            for (k, v) in env_vars {
+                cmd.env(k, v);
+            }
+        }
+            
+        let mut child = cmd.spawn().expect("failed to spawn daemon");
         let stderr_lines = Arc::new(Mutex::new(Vec::new()));
         let stderr = stderr_lines.clone();
         if let Some(err) = child.stderr.take() {
@@ -57,7 +80,26 @@ impl DaemonHandle {
                 }
             });
         }
-        DaemonHandle { child, stderr_lines }
+        
+        let (tx, rx) = mpsc::channel::<String>();
+        if let Some(stdout) = child.stdout.take() {
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines() {
+                    match line {
+                        Ok(l) => {
+                            eprintln!("[daemon stdout] {}", l);
+                            if tx.send(l).is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+        }
+        
+        DaemonHandle { child, stderr_lines, stdout_rx: Some(rx) }
     }
 
     fn send(&mut self, msg: &Value) {
@@ -67,25 +109,8 @@ impl DaemonHandle {
     }
 
     /// Read stdout lines until one parses as JSON containing `needle`, or timeout.
-    /// Takes stdout; use at most once per handle. A reader thread keeps
-    /// draining the pipe so the timeout holds even if the daemon goes silent.
     fn wait_for(&mut self, needle: &str, timeout: Duration) -> Option<Value> {
-        let stdout = self.child.stdout.take().unwrap();
-        let (tx, rx) = mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => {
-                        if tx.send(l).is_err() {
-                            return;
-                        }
-                    }
-                    Err(_) => return,
-                }
-            }
-        });
-
+        let rx = self.stdout_rx.as_ref().unwrap();
         let deadline = Instant::now() + timeout;
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             let line = match rx.recv_timeout(remaining) {
@@ -382,4 +407,146 @@ fn graceful_drain_on_sigterm() {
     {
         eprintln!("skipping SIGTERM test on non-unix platform");
     }
+}
+
+// ── Phase 7 tests ─────────────────────────────────────────────────────────────
+
+#[test]
+fn clock_offset_simulation_prevents_split_brain() {
+    let bin = match daemon_binary() { Some(b) => b, None => return };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join(".snerdata");
+
+    let mut daemon_a = DaemonHandle::spawn(&bin, &storage, "1");
+    daemon_a.send(&json!({"action": "register", "task_type": "echo"}));
+    daemon_a.wait_for("Registered handler", Duration::from_secs(10)).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Daemon B boots with a +3s clock offset. Margin is 5s, so it should NOT claim the lease.
+    let mut daemon_b = DaemonHandle::spawn_with_offset(&bin, &storage, "1", 3);
+    daemon_b.send(&json!({"action": "register", "task_type": "echo"}));
+    daemon_b.send(&json!({
+        "action": "enqueue", "task_id": "test-split-brain", "task_type": "echo",
+        "task_data": "x", "max_retries": 0, "retry_after_hours": 0.0
+    }));
+
+    let resp = daemon_b.wait_for("test-split-brain", Duration::from_secs(10)).unwrap();
+    assert_eq!(resp["action"], "error");
+    assert_eq!(resp["message"], "[Snerd] No shards owned by this instance");
+}
+
+#[test]
+fn stalled_but_alive_owner_is_downgraded_by_flock() {
+    let bin = match daemon_binary() { Some(b) => b, None => return };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join(".snerdata");
+
+    let mut daemon_a = DaemonHandle::spawn(&bin, &storage, "1");
+    daemon_a.send(&json!({"action": "register", "task_type": "echo"}));
+    // We can't use wait_for multiple times, so we wait for the last event.
+    // Pause A's heartbeat.
+    daemon_a.send(&json!({"action": "test_pause_heartbeat"}));
+    daemon_a.wait_for("Heartbeat paused", Duration::from_secs(10)).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // B boots with +20s clock, thinks A's lease is lapsed.
+    let mut daemon_b = DaemonHandle::spawn_with_offset(&bin, &storage, "1", 40);
+    daemon_b.send(&json!({"action": "register", "task_type": "echo"}));
+    daemon_b.send(&json!({
+        "action": "enqueue", "task_id": "test-stall", "task_type": "echo",
+        "task_data": "x", "max_retries": 0, "retry_after_hours": 0.0
+    }));
+
+    // B should revert the claim due to A's flock, and remain in standby.
+    let resp = daemon_b.wait_for("test-stall", Duration::from_secs(10)).unwrap();
+    assert_eq!(resp["action"], "error");
+    assert_eq!(resp["message"], "[Snerd] No shards owned by this instance");
+}
+
+#[test]
+#[cfg(unix)]
+fn sigkill_mid_drain_guarantees_at_least_once_delivery() {
+    let bin = match daemon_binary() { Some(b) => b, None => return };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join(".snerdata");
+
+    let mut daemon_a = DaemonHandle::spawn(&bin, &storage, "1");
+    daemon_a.send(&json!({"action": "register", "task_type": "long_task"}));
+    daemon_a.send(&json!({
+        "action": "enqueue", "task_id": "crash-task", "task_type": "long_task",
+        "task_data": "x", "max_retries": 0, "retry_after_hours": 0.0
+    }));
+    
+    let exec = daemon_a.wait_for("\"execute\"", Duration::from_secs(10)).unwrap();
+    assert_eq!(exec["task_id"], "crash-task");
+
+    // SIGKILL daemon A
+    let pid = daemon_a.child.id();
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+    let _ = daemon_a.child.wait(); 
+    
+    // Spawn daemon B with +20s offset so it immediately takes over A's lapsed lease.
+    let mut daemon_b = DaemonHandle::spawn_with_offset(&bin, &storage, "1", 40);
+    daemon_b.send(&json!({"action": "register", "task_type": "long_task"}));
+    
+    // Daemon B should adopt the shard, find the incomplete task, and redispatch it!
+    let re_exec = daemon_b.wait_for("\"execute\"", Duration::from_secs(15)).unwrap();
+    assert_eq!(re_exec["task_id"], "crash-task");
+    
+    daemon_b.kill();
+}
+
+#[test]
+fn worker_pools_isolate_concurrency() {
+    let bin = match daemon_binary() { Some(b) => b, None => return };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join(".snerdata");
+
+    // Spawn daemon with default pool = 1, urgent pool = 10
+    let env_vars = vec![("SNERD_POOLS", "default=1,urgent=10")];
+    let mut daemon = DaemonHandle::spawn_with_env(&bin, &storage, "1", 0, Some(env_vars));
+
+    daemon.send(&json!({"action": "register", "task_type": "slow_task"}));
+    daemon.send(&json!({"action": "register", "task_type": "urgent_task"}));
+
+    // Enqueue 2 slow tasks. Since default pool has size 1, only 1 should execute.
+    for i in 1..=2 {
+        daemon.send(&json!({
+            "action": "enqueue", "task_id": format!("slow-{}", i), "task_type": "slow_task",
+            "task_data": "x", "max_retries": 0, "retry_after_hours": 0.0
+        }));
+    }
+
+    // Wait for the first slow task to start executing
+    let exec_slow = daemon.wait_for("\"execute\"", Duration::from_secs(10)).unwrap();
+    assert!(exec_slow["task_id"].as_str().unwrap().starts_with("slow-"));
+    
+    // We intentionally DO NOT send a "result" for the slow task, simulating it blocking the single default worker forever.
+
+    // Enqueue 5 urgent tasks, specifying the "urgent" pool
+    for i in 1..=5 {
+        daemon.send(&json!({
+            "action": "enqueue", "task_id": format!("urgent-{}", i), "task_type": "urgent_task",
+            "task_data": "x", "max_retries": 0, "retry_after_hours": 0.0,
+            "pool": "urgent"
+        }));
+    }
+
+    // Wait for all 5 urgent tasks to execute! They should NOT be blocked by the stalled slow task.
+    let mut urgent_seen = 0;
+    while urgent_seen < 5 {
+        let exec = daemon.wait_for("\"execute\"", Duration::from_secs(5)).unwrap();
+        // It could be slow-2 if it wasn't isolated, but slow-2 is blocked!
+        assert!(exec["task_id"].as_str().unwrap().starts_with("urgent-"));
+        urgent_seen += 1;
+        
+        // Complete the urgent task immediately
+        daemon.send(&json!({
+            "action": "result", "task_id": exec["task_id"], "status": "success"
+        }));
+    }
+
+    assert_eq!(urgent_seen, 5);
+
+    daemon.kill();
 }
