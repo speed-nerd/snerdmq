@@ -30,6 +30,8 @@ pub enum IncomingMessage {
         max_execution_seconds: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pool: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        trigger_after_ids: Option<Vec<String>>,
     },
     #[serde(rename = "progress")]
     Progress {

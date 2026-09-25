@@ -380,6 +380,81 @@ fn cmd_validate(queue_dir: &str) -> bool {
     healthy
 }
 
+/// `snerdmq replay --type="..." <queue-dir>` — recover failed tasks.
+fn cmd_replay(target_type: &str, queue_dir: &str) -> std::io::Result<()> {
+    let dir = PathBuf::from(queue_dir);
+    let store = MembershipStore::new(&dir);
+    let m = store.load().map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, format!("Failed to read membership: {:?}", e))
+    })?;
+
+    let mut total_recovered = 0;
+
+    for i in 0..m.shards {
+        let key = crate::membership::shard_key(i);
+        // Try lock to ensure daemon is not running this shard
+        let lock = crate::sharding::try_lock_shard(&dir, &key)?;
+        if lock.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Shard '{}' is locked by a running daemon. Please stop the daemon before running replay.", key),
+            ));
+        }
+        
+        let sdir = shard_dir(&dir, &key);
+        let tasks_log = sdir.join("tasks").join("tasks.log");
+        if !tasks_log.exists() {
+            continue;
+        }
+
+        // We use FileStore to rebuild metadata and get the cache of latest states
+        // But FileStore only keeps active tasks!
+        // To find failed tasks, we must read the log ourselves.
+        let file = fs::File::open(&tasks_log)?;
+        let reader = std::io::BufReader::new(file);
+        use std::io::BufRead;
+        let mut latest_state: std::collections::HashMap<String, crate::task::RetryableTask> = std::collections::HashMap::new();
+        
+        for line_res in reader.lines() {
+            let line = line_res?;
+            if line.trim().is_empty() { continue; }
+            if let Ok(task) = serde_json::from_str::<crate::task::RetryableTask>(&line) {
+                // If the task is older, the newer one overwrites.
+                // Or if it's newer, it overwrites. The log is append-only.
+                latest_state.insert(task.task_id.clone(), task);
+            }
+        }
+
+        let mut to_recover = Vec::new();
+        for (_, mut task) in latest_state {
+            if task.deleted_at.is_some() && task.last_error_obj.is_some() {
+                if target_type == "all" || task.task_type == target_type {
+                    // It's a failed task of the target type!
+                    task.retry_count = 0;
+                    task.deleted_at = None;
+                    task.last_error_obj = None;
+                    task.last_job_error = None;
+                    task.execute_at = chrono::Utc::now();
+                    to_recover.push(task);
+                }
+            }
+        }
+
+        if !to_recover.is_empty() {
+            let mut out_file = std::fs::OpenOptions::new().append(true).open(&tasks_log)?;
+            use std::io::Write;
+            for task in to_recover.iter() {
+                let json = serde_json::to_string(task)?;
+                writeln!(out_file, "{}", json)?;
+            }
+            total_recovered += to_recover.len();
+        }
+    }
+
+    println!("[Snerd] Replay complete. Recovered {} failed task(s) into the active queue.", total_recovered);
+    Ok(())
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -410,6 +485,28 @@ async fn main() {
                 }
                 let healthy = cmd_validate(&args[2]);
                 std::process::exit(if healthy { 0 } else { 1 });
+            }
+            "replay" => {
+                let mut target_type = "all".to_string();
+                let mut queue_dir = ".snerdata".to_string();
+                
+                let mut i = 2;
+                while i < args.len() {
+                    if args[i].starts_with("--type=") {
+                        target_type = args[i].strip_prefix("--type=").unwrap().to_string();
+                    } else if args[i] == "--type" && i + 1 < args.len() {
+                        target_type = args[i+1].clone();
+                        i += 1;
+                    } else if !args[i].starts_with("-") {
+                        queue_dir = args[i].clone();
+                    }
+                    i += 1;
+                }
+                
+                match cmd_replay(&target_type, &queue_dir) {
+                    Ok(()) => std::process::exit(0),
+                    Err(e) => { eprintln!("[Snerd] replay failed: {}", e); std::process::exit(1); }
+                }
             }
             _ => {} // fall through to daemon mode
         }
@@ -695,6 +792,7 @@ async fn main() {
                 webhook_url,
                 max_execution_seconds,
                 pool,
+                trigger_after_ids,
             }) => {
                 // Reject if shutting down.
                 if runtime.shutting_down.load(Ordering::Acquire) {
@@ -754,6 +852,7 @@ async fn main() {
                     webhook_url,
                     max_execution_seconds,
                     pool,
+                    trigger_after_ids,
                 );
                 if let Err(e) = engine.queue.enqueue(t) {
                     println!(

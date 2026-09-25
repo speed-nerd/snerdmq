@@ -1,6 +1,6 @@
 <div align="center">
   <img src="./assets/Designer-9.png" height="120" alt="SnerdMQ Logo" />
-  <h1>SnerdMQ v0.2.10</h1>
+  <h1>SnerdMQ v0.3.0</h1>
   <p>The AI polyglot background job queue daemon powered by Rust.</p>
 
   [![Crates.io](https://img.shields.io/crates/v/snerdmq)](https://crates.io/crates/snerdmq)
@@ -12,14 +12,17 @@
 
 It runs as a child process and communicates via incredibly fast JSON over standard I/O pipes.
 
-## ✨ v0.2.10 "AI" Features
+## ✨ v0.3.0 "AI" Features
 
 Traditional message brokers force you to manage external servers. **SnerdMQ eliminates the network entirely** while bringing advanced orchestration specifically designed for AI workloads:
 
 - **Smart API Rate-Limiting**: Natively tracks `rate_limit_group` execution velocity. If you burst hundreds of LLM generation jobs, SnerdMQ pauses dispatching to prevent 429 "Too Many Requests" HTTP errors.
 - **Payload-Hashing Deduplication**: Automatically computes a cryptographic hash of your `task_data`. If an identical payload is in the queue (`auto_dedupe`), it silently drops the duplicate.
 - **Dynamic Float Prioritization**: A true Binary Max-Heap sorts pending jobs by an `urgency_score` (e.g., `0.95`). High-priority AI tasks bypass the standard FIFO queue with 0ms latency.
+- **Job Chaining (DAGs)**: Define complex workflow dependencies natively. Tasks wait in a blocked state until their parent tasks succeed. Perfect for multi-step AI pipelines.
 - **Progress Streaming & Dashboard**: SDKs can emit `yieldProgress` partial chunks (ideal for streaming LLM tokens). The SnerdMQ daemon multiplexes these updates to a **built-in React UI dashboard** running on an embedded HTTP/WebSocket server.
+- **Worker Pools**: Prevent slow generative AI tasks from starving fast DB tasks by dedicating workers to specific pools (e.g. `"urgent"`).
+- **Sharded Queues**: Distribute load across multiple queue nodes safely using file-backed lock sharding (`SNERD_MAX_SHARDS`).
 - **Bulletproof Durability**: `fs3` OS-level file locking ensures 100% ACID compliance and corruption-free local storage.
 
 
@@ -42,8 +45,10 @@ SnerdMQ expects simple JSON objects over STDIN. Here is exactly what an advanced
   "max_per_minute": 50,             // Prevent 429 API errors
   "execute_at": "2026-10-31T23:59:00Z", // Schedule for future execution
   "cron": "0 * * * *",              // Recurring cron schedule
+  "trigger_after_ids": ["req_9920"], // Block until parent task(s) succeed
+  "pool": "urgent",                 // Dedicate task to a specific worker pool
   
-  // v0.2.10 Webhook Feature
+  // v0.3.0 Webhook Feature
   "webhook_url": "https://api.example.com/webhook" // Execute via HTTP instead of local handlers
 }
 ```
@@ -51,7 +56,7 @@ SnerdMQ expects simple JSON objects over STDIN. Here is exactly what an advanced
 *Note: You rarely have to write this JSON yourself! The official Thin Client SDKs handle all of this automatically.*
 
 
-### ⚙️ Advanced Task Configuration (v0.2.10)
+### ⚙️ Advanced Task Configuration (v0.3.0)
 To power complex AI workflows, tasks can now be configured with advanced orchestration parameters:
 
 * **`auto_dedupe` (`bool`)**: If set to `true`, the daemon computes a cryptographic hash of the `task_type` and `task_data`. If an identical payload is currently sitting in the queue pending execution, this new task is silently dropped. Excellent for preventing duplicate generative AI requests from trigger-happy users!
@@ -62,6 +67,8 @@ To power complex AI workflows, tasks can now be configured with advanced orchest
 * **`cron` (`string`)**: A cron expression (e.g. `"0 * * * *"`) for recurring jobs. Shorthands like `"2h"` or `"10m"` are also supported.
 * **`webhook_url` (`string`)**: By providing a webhook URL, SnerdMQ will completely bypass your local SDK handlers and dispatch the task payload via an HTTP POST request directly to the specified URL.
 * **`max_execution_seconds` (`u64`)**: Optional hard timeout in seconds. If execution takes longer, the worker pool forceful kills it.
+* **`trigger_after_ids` (`array of strings`)**: A list of parent task IDs that must complete successfully before this task is allowed to dispatch. Enables complex DAG workflows natively within the queue.
+* **`pool` (`string`)**: Dedicate this task to a specific worker pool (e.g. `"urgent"`). Use `SNERD_POOLS` environment variable to allocate workers per pool at daemon startup.
 
 ### Note on Hard Timeouts (`max_execution_seconds`)
 When `max_execution_seconds` is provided, the Rust daemon wraps the execution in a `tokio::time::timeout`. If the task execution takes longer than the timeout, the daemon will cancel the task, free up the worker slot, and mark the execution as failed (it will be retried if `max_retries` allows).
@@ -140,7 +147,7 @@ async fn handle_send_push(
 ## ⚡ Architecture (Zero Networking)
 
 <div align="center">
-  <img src="./assets/architecture.gif" alt="SnerdMQ v0.2.10 Architecture" />
+  <img src="./assets/architecture.gif" alt="SnerdMQ v0.3.0 Architecture" />
   <br/>
   <i>Zero-latency embedded queue orchestration featuring Real-Time Tracking</i>
 </div>
@@ -157,7 +164,7 @@ The daemon exclusively owns its storage directory: at startup it takes an **OS-l
 [Snerd] ERROR: Another daemon is already running on storage '.snerdata'.
 ```
 
-This is by design — two processors on the same job log would race and **double-execute jobs**. The recommended topology is **one daemon (one SDK client) per application process**, with every job type registered on it and one shared dashboard. Need isolation between workloads? Give each queue its own storage directory — every SDK constructor accepts a custom storage path. See the "Queue Topology" section in each SDK's README for per-language examples.
+This is by design — two processors blindly writing to the same job log would race and **double-execute jobs**. To scale out on the same disk, you must initialize the daemon with `SNERD_MAX_SHARDS` (e.g., `4`). The engine will automatically partition the file-locks and distribute load among instances safely. Otherwise, the recommended topology is **one daemon (one SDK client) per application process**. See the "Queue Topology" section in each SDK's README for per-language examples.
 
 ## 🌍 Distributed Scaling (Kubernetes / EC2)
 
