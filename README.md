@@ -8,6 +8,8 @@
   [![Docs](https://img.shields.io/badge/docs-speed--nerd.github.io-blue)](https://speed-nerd.github.io/docs/)
 </div>
 
+> 📝 **What's New in v0.3.0?** Check out the [Changelog & Releases](https://speed-nerd.github.io/docs/changelog) for the latest features including Sharded Queues, Worker Pools, and Job Chaining!
+
 `snerdmq` is a specialized, embedded sidecar daemon that handles complex queue orchestration (file locking, retries, dead-letter queues, and now **AI orchestration**) in highly-optimized Rust. It lets you write your execution logic natively in **Node.js, Python, Go, Ruby, PHP, Java, or C#**.
 
 It runs as a child process and communicates via incredibly fast JSON over standard I/O pipes.
